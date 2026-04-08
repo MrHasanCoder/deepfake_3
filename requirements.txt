@@ -1,0 +1,28 @@
+# ─── Core (DO NOT install via this file) ────────────────
+# Install separately:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ─── Data & Vision ─────────────────────────────────────
+opencv-python>=4.8.0
+mediapipe>=0.10.9
+Pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ─── ML & Metrics ──────────────────────────────────────
+scikit-learn>=1.3.0
+tqdm>=4.66.0
+
+# ─── ONNX (for inference optimization) ─────────────────
+onnx>=1.15.0
+onnxruntime-gpu>=1.16.0
+
+# ─── Web App (optional) ─────────────────────────────────
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# ─── Virtual Webcam (Google Meet integration) ───────────
+pyvirtualcam>=0.10.0
+
+# ─── Visualization ──────────────────────────────────────
+matplotlib>=3.7.0

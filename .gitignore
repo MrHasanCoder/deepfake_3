@@ -1,0 +1,14 @@
+checkpoints/
+inference_logs/
+exports/
+gradcam_outputs/
+datasets/
+webapp/static/uploads/
+**pycache**/
+*.pyc
+*.pth
+*.onnx
+*.engine
+*.log
+*.egg-info/
+.env
