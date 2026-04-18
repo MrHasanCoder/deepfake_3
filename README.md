@@ -139,8 +139,7 @@ mv best_model.pth checkpoints/best_model.pth
 
 ```bash
 mkdir checkpoints
-# Replace <TAG> with the release version (e.g., v1.0.0)
-curl -L -o checkpoints/best_model.pth https://github.com/MrHasanCoder/deepfake_3/releases/download/<TAG>/best_model.pth
+curl -L -o checkpoints/best_model.pth https://github.com/MrHasanCoder/deepfake_3/releases/download/v1.0.0/best_model.pth
 ```
 
 ### MediaPipe models (auto-download)
