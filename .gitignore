@@ -4,7 +4,7 @@ exports/
 gradcam_outputs/
 datasets/
 webapp/static/uploads/
-**pycache**/
+__pycache__/
 *.pyc
 *.pth
 *.onnx
@@ -12,3 +12,15 @@ webapp/static/uploads/
 *.log
 *.egg-info/
 .env
+
+# Large dataset & test directories
+deepfake_dataset/
+test_videos/
+test_results/
+
+# IDE
+.vscode/
+
+# Model files (download separately)
+face_landmarker.task
+face_detection_short_range.tflite

@@ -505,7 +505,7 @@ class GradCAM:
     def _register_hooks(self):
         target = self.model.branch_mobile.features[self.TARGET_LAYER_IDX]
         print(f"[GradCAM++] Target layer: features[{self.TARGET_LAYER_IDX}] "
-              f"→ {type(target).__name__}")
+              f"-> {type(target).__name__}")
 
 
         def fwd_hook(module, inp, out):

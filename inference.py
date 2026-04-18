@@ -23,7 +23,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Optional, Tuple
+from typing import Any, Deque, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
@@ -40,7 +40,7 @@ from models import DeepfakeDetector, GradCAM
 # Constants
 # ============================================================================
 
-FAKE_THRESHOLD = 0.65
+FAKE_THRESHOLD = 0.63
 IMG_SIZE = 224
 N_FRAMES = 5
 FACE_DETECT_EVERY = 4
@@ -88,6 +88,37 @@ class FaceObservation:
     landmarks: Optional[List]
     landmark_score: float
     refined_bbox: Tuple[int, int, int, int]
+
+
+@dataclass
+class FramePrediction:
+    frame_id: int
+    raw_prob: float
+    smooth_prob: float
+    prediction_label: str
+    analysis_status: str
+    ear: float
+    ear_var: float
+    face_state: str
+    sharpness: float
+    bbox: Optional[Tuple[int, int, int, int]]
+    latency_ms: float
+    cam_overlay: Optional[np.ndarray] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "frame_id": self.frame_id,
+            "raw_prob": self.raw_prob,
+            "smooth_prob": self.smooth_prob,
+            "prediction": self.prediction_label,
+            "analysis_status": self.analysis_status,
+            "ear": self.ear,
+            "ear_variance": self.ear_var,
+            "face_state": self.face_state,
+            "sharpness": self.sharpness,
+            "bbox": list(self.bbox) if self.bbox else None,
+            "latency_ms": self.latency_ms,
+        }
 
 
 class FaceAnalyzer:
@@ -384,6 +415,198 @@ class PredictionStabilizer:
         self.candidate_count = 0
 
 
+class DeepfakeInferenceEngine:
+    """
+    Reusable inference engine for webcam, uploaded videos, and browser-fed frames.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        source: str = "webcam",
+        gradcam: bool = False,
+        face_detector_model: str = "face_detection_short_range.tflite",
+        face_landmarker_model: str = "face_landmarker.task",
+    ):
+        self.source = source
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[Inference] Device: {self.device}")
+
+        self.model = DeepfakeDetector(n_segment=N_FRAMES).to(self.device)
+        ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ckpt["model"])
+        self.model.eval()
+
+        global FAKE_THRESHOLD
+        saved_thresh = float(ckpt.get("best_thresh", 0.5))
+        threshold_bump = 0.15 if is_webcam_source(source) else 0.0
+        FAKE_THRESHOLD = min(saved_thresh + threshold_bump, 0.80)
+        print(
+            f"[Inference] Model loaded | Trained thresh: {saved_thresh:.4f} "
+            f"| Applied bump: {threshold_bump:.2f} | Final thresh: {FAKE_THRESHOLD:.4f}"
+        )
+        print(f"[Inference] Best AUC from training: {ckpt.get('best_auc', '?')}")
+
+        self.grad_cam = GradCAM(self.model) if gradcam else None
+        self.tracker = FaceAnalyzer(
+            detector_model_path=face_detector_model,
+            landmarker_model_path=face_landmarker_model,
+        )
+        self.blinker = BlinkDetector(history_len=60)
+        self.buf = FrameBuffer(n_frames=N_FRAMES)
+        self.smoother = ProbSmoother(window=SMOOTH_WINDOW)
+        self.stabilizer = PredictionStabilizer(threshold=FAKE_THRESHOLD)
+        self.frame_id = 0
+        self.raw_prob = 0.5
+        self.smooth_prob = 0.5
+        self.missed_face_frames = 0
+        self.prediction_label = "REAL"
+
+    def reset_state(self) -> None:
+        self.buf.reset()
+        self.smoother.reset()
+        self.stabilizer.reset()
+        self.raw_prob = 0.5
+        self.smooth_prob = 0.5
+        self.missed_face_frames = 0
+        self.prediction_label = "REAL"
+
+    def process_frame(self, frame: np.ndarray) -> FramePrediction:
+        t_start = time.perf_counter()
+        observation = self.tracker.analyze(frame)
+        face_tensor = None
+        bbox = None
+        ear = 0.0
+        ear_var = 0.0
+        face_state = "searching"
+        sharpness = 0.0
+        cam_overlay = None
+
+        if observation is None:
+            self.missed_face_frames += 1
+            face_state = "no_face"
+        else:
+            bbox = observation.refined_bbox
+            ear, ear_var = self.blinker.update(
+                observation.landmarks,
+                frame.shape[1],
+                frame.shape[0],
+            )
+            face_crop = crop_face(frame, bbox)
+            quality_ok, face_state, sharpness = face_quality_ok(face_crop, bbox)
+            if quality_ok:
+                face_tensor = preprocess_face(face_crop, self.device)
+                self.buf.push(face_tensor)
+                self.missed_face_frames = 0
+            else:
+                self.missed_face_frames += 1
+
+        analysis_status = (
+            "SUSPICIOUS_NO_FACE"
+            if self.missed_face_frames >= SUSPICIOUS_FACE_LOSS_FRAMES
+            else "OK"
+        )
+
+        if self.missed_face_frames >= MAX_MISSED_FACE_FRAMES:
+            self.reset_state()
+
+        if self.buf.ready() and face_tensor is not None:
+            seq = self.buf.get_sequence()
+            if self.grad_cam is not None:
+                self.model.zero_grad(set_to_none=True)
+                logit = self.model(face_tensor, seq)
+                cam_overlay = self.grad_cam.generate(face_tensor, seq)
+            else:
+                with torch.no_grad():
+                    logit = self.model(face_tensor, seq)
+                cam_overlay = None
+
+            self.raw_prob = float(torch.sigmoid(logit).reshape(-1)[0].item())
+            self.smooth_prob = self.smoother.update(self.raw_prob)
+            self.prediction_label = self.stabilizer.update(self.smooth_prob)
+
+        latency_ms = (time.perf_counter() - t_start) * 1000.0
+        result = FramePrediction(
+            frame_id=self.frame_id,
+            raw_prob=self.raw_prob,
+            smooth_prob=self.smooth_prob,
+            prediction_label=self.prediction_label,
+            analysis_status=analysis_status,
+            ear=ear,
+            ear_var=ear_var,
+            face_state=face_state,
+            sharpness=sharpness,
+            bbox=bbox,
+            latency_ms=latency_ms,
+            cam_overlay=cam_overlay,
+        )
+        self.frame_id += 1
+        return result
+
+    def render_prediction(self, frame: np.ndarray, result: FramePrediction) -> np.ndarray:
+        display = render_overlay(
+            frame,
+            result.bbox,
+            result.smooth_prob,
+            result.raw_prob,
+            result.prediction_label,
+            result.analysis_status,
+            result.ear,
+            result.ear_var,
+            result.face_state,
+            result.sharpness,
+            result.cam_overlay,
+        )
+        cv2.putText(
+            display,
+            f"{result.latency_ms:.1f}ms",
+            (display.shape[1] - 120, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (100, 255, 100),
+            1,
+        )
+        return display
+
+    def analyze_video_file(self, video_path: str, max_frames: Optional[int] = None) -> dict[str, Any]:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video source: {video_path}")
+
+        self.reset_state()
+        self.frame_id = 0
+        predictions: List[FramePrediction] = []
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                predictions.append(self.process_frame(frame))
+                if max_frames is not None and len(predictions) >= max_frames:
+                    break
+        finally:
+            cap.release()
+
+        if not predictions:
+            return {
+                "prediction": "UNKNOWN",
+                "confidence": 0.0,
+                "frames_processed": 0,
+                "detail": "No readable frames were found in the video",
+            }
+
+        avg_prob = float(np.mean([item.smooth_prob for item in predictions]))
+        fake_votes = sum(1 for item in predictions if item.prediction_label == "FAKE")
+        final_label = "FAKE" if fake_votes >= max(1, len(predictions) // 2) else "REAL"
+        return {
+            "prediction": final_label,
+            "confidence": avg_prob,
+            "frames_processed": len(predictions),
+            "fake_votes": fake_votes,
+            "analysis_status": predictions[-1].analysis_status,
+        }
+
+
 # ============================================================================
 # Overlay
 # ============================================================================
@@ -445,41 +668,25 @@ def is_webcam_source(source: str) -> bool:
     return source == "webcam" or source == "0"
 
 
+def terminal_verdict_text(prediction_label: str, analysis_status: str) -> str:
+    if analysis_status == "SUSPICIOUS_NO_FACE":
+        return "SUSPICIOUS_NO_FACE"
+    return "DEEPFAKE" if prediction_label == "FAKE" else "REAL"
+
+
 def run_inference(args) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Inference] Device: {device}")
-
-    model = DeepfakeDetector(n_segment=N_FRAMES).to(device)
-    ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-
-    global FAKE_THRESHOLD
-    saved_thresh = float(ckpt.get("best_thresh", 0.5))
-    threshold_bump = 0.15 if is_webcam_source(args.source) else 0.0
-    FAKE_THRESHOLD = min(saved_thresh + threshold_bump, 0.80)
-    print(
-        f"[Inference] Model loaded | Trained thresh: {saved_thresh:.4f} "
-        f"| Applied bump: {threshold_bump:.2f} | Final thresh: {FAKE_THRESHOLD:.4f}"
+    engine = DeepfakeInferenceEngine(
+        model_path=args.model_path,
+        source=args.source,
+        gradcam=args.gradcam,
+        face_detector_model=args.face_detector_model,
+        face_landmarker_model=args.face_landmarker_model,
     )
-    print(f"[Inference] Best AUC from training: {ckpt.get('best_auc', '?')}")
-
-    grad_cam = GradCAM(model) if args.gradcam else None
-
     cap_source = 0 if is_webcam_source(args.source) else args.source
     cap = cv2.VideoCapture(cap_source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video source: {args.source}")
     cap.set(cv2.CAP_PROP_FPS, 30)
-
-    tracker = FaceAnalyzer(
-        detector_model_path=args.face_detector_model,
-        landmarker_model_path=args.face_landmarker_model,
-    )
-    blinker = BlinkDetector(history_len=60)
-    buf = FrameBuffer(n_frames=N_FRAMES)
-    smoother = ProbSmoother(window=SMOOTH_WINDOW)
-    stabilizer = PredictionStabilizer(threshold=FAKE_THRESHOLD)
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -514,18 +721,9 @@ def run_inference(args) -> None:
         except ImportError:
             print("[VirtualCam] pyvirtualcam not installed. Skipping.")
 
-    frame_id = 0
-    raw_prob = 0.5
-    smooth_prob = 0.5
-    bbox = None
-    ear = 0.0
-    ear_var = 0.0
-    cam_overlay = None
-    face_state = "searching"
-    sharpness = 0.0
-    missed_face_frames = 0
-    prediction_label = "REAL"
-    analysis_status = "OK"
+    last_terminal_verdict = None
+    real_count = 0
+    fake_count = 0
 
     print("[Inference] Running... Press 'q' to quit.")
 
@@ -535,104 +733,49 @@ def run_inference(args) -> None:
             if not ret:
                 break
 
-            t_start = time.perf_counter()
-            observation = tracker.analyze(frame)
-            face_tensor = None
-
-            if observation is None:
-                missed_face_frames += 1
-                bbox = None
-                ear = 0.0
-                ear_var = 0.0
-                face_state = "no_face"
-                sharpness = 0.0
-            else:
-                bbox = observation.refined_bbox
-                ear, ear_var = blinker.update(observation.landmarks, frame.shape[1], frame.shape[0])
-                face_crop = crop_face(frame, bbox)
-                quality_ok, face_state, sharpness = face_quality_ok(face_crop, bbox)
-
-                if quality_ok:
-                    face_tensor = preprocess_face(face_crop, device)
-                    buf.push(face_tensor)
-                    missed_face_frames = 0
+            result = engine.process_frame(frame)
+            terminal_verdict = terminal_verdict_text(
+                result.prediction_label,
+                result.analysis_status,
+            )
+            if result.analysis_status != "SUSPICIOUS_NO_FACE":
+                if result.prediction_label == "FAKE":
+                    fake_count += 1
                 else:
-                    missed_face_frames += 1
+                    real_count += 1
 
-            analysis_status = "SUSPICIOUS_NO_FACE" if missed_face_frames >= SUSPICIOUS_FACE_LOSS_FRAMES else "OK"
+            if terminal_verdict != last_terminal_verdict:
+                print(
+                    f"[Terminal Verdict] Frame {result.frame_id}: {terminal_verdict} "
+                    f"(raw={result.raw_prob:.3f}, smooth={result.smooth_prob:.3f})"
+                )
+                last_terminal_verdict = terminal_verdict
 
-            if missed_face_frames >= MAX_MISSED_FACE_FRAMES:
-                buf.reset()
-                smoother.reset()
-                stabilizer.reset()
-                cam_overlay = None
-                raw_prob = 0.5
-                smooth_prob = 0.5
-                prediction_label = "REAL"
-
-            if buf.ready() and face_tensor is not None:
-                seq = buf.get_sequence()
-                if grad_cam is not None:
-                    model.zero_grad(set_to_none=True)
-                    logit = model(face_tensor, seq)
-                    cam_overlay = grad_cam.generate(face_tensor, seq)
-                else:
-                    with torch.no_grad():
-                        logit = model(face_tensor, seq)
-                    cam_overlay = None
-
-                raw_prob = float(torch.sigmoid(logit).reshape(-1)[0].item())
-                smooth_prob = smoother.update(raw_prob)
-                prediction_label = stabilizer.update(smooth_prob)
-
-            latency_ms = (time.perf_counter() - t_start) * 1000.0
             ts_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC)) if not is_webcam_source(args.source) else int(time.time() * 1000)
 
             writer.writerow(
                 [
-                    frame_id,
+                    result.frame_id,
                     ts_ms,
-                    round(raw_prob, 5),
-                    round(smooth_prob, 5),
-                    prediction_label,
-                    analysis_status,
-                    round(ear, 5),
-                    round(ear_var, 8),
-                    face_state,
-                    round(sharpness, 2),
-                    round(latency_ms, 2),
+                    round(result.raw_prob, 5),
+                    round(result.smooth_prob, 5),
+                    result.prediction_label,
+                    result.analysis_status,
+                    round(result.ear, 5),
+                    round(result.ear_var, 8),
+                    result.face_state,
+                    round(result.sharpness, 2),
+                    round(result.latency_ms, 2),
                 ]
             )
 
-            display = render_overlay(
-                frame,
-                bbox,
-                smooth_prob,
-                raw_prob,
-                prediction_label,
-                analysis_status,
-                ear,
-                ear_var,
-                face_state,
-                sharpness,
-                cam_overlay,
-            )
-            cv2.putText(
-                display,
-                f"{latency_ms:.1f}ms",
-                (display.shape[1] - 120, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (100, 255, 100),
-                1,
-            )
+            display = engine.render_prediction(frame, result)
             cv2.imshow("DeepfakeDetector", display)
 
             if virtual_cam is not None:
                 virtual_cam.send(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
                 virtual_cam.sleep_until_next_frame()
 
-            frame_id += 1
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
@@ -641,6 +784,19 @@ def run_inference(args) -> None:
         if virtual_cam is not None:
             virtual_cam.close()
         cv2.destroyAllWindows()
+
+    if not is_webcam_source(args.source):
+        if fake_count > real_count:
+            final_video_verdict = "DEEPFAKE"
+        elif real_count > 0:
+            final_video_verdict = "REAL"
+        else:
+            final_video_verdict = "INCONCLUSIVE"
+
+        print(
+            f"[Final Video Verdict] {final_video_verdict} "
+            f"(REAL frames={real_count}, DEEPFAKE frames={fake_count})"
+        )
 
     print(f"[Inference] Frame log saved to {csv_path}")
 

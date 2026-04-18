@@ -286,24 +286,48 @@ def train(args):
     if args.resume and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_auc    = ckpt.get("best_auc", 0.0)
         logger.info(f"Resumed from epoch {start_epoch}")
 
+        # If resuming past unfreeze epoch, unfreeze backbone and rebuild
+        # optimizer with 2 param groups BEFORE loading optimizer state
+        if start_epoch > args.unfreeze_epoch:
+            model.unfreeze_backbone()
+            optimizer = optim.Adam([
+                {"params": model.branch_mobile.features.parameters(), "lr": args.lr * 0.1},
+                {"params": [p for n, p in model.named_parameters()
+                            if "branch_mobile.features" not in n], "lr": args.lr},
+            ], weight_decay=1e-4)
+            logger.info(f"  Backbone unfrozen (past unfreeze epoch {args.unfreeze_epoch})")
+
+        # Try loading optimizer state; skip if param groups don't match
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            logger.info("  Optimizer state restored")
+        except (ValueError, KeyError):
+            logger.warning("  Optimizer state mismatch — using fresh optimizer (model weights OK)")
+
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs - start_epoch
+        )
+
     # ── Epoch-level CSV ───────────────────────────────────────────
-    log_csv    = open(Path(args.ckpt_dir) / "training_log.csv", "w",
+    csv_mode = "a" if (args.resume and start_epoch > 0) else "w"
+    log_csv    = open(Path(args.ckpt_dir) / "training_log.csv", csv_mode,
                       newline="", encoding="utf-8")
     csv_writer = csv.writer(log_csv)
-    csv_writer.writerow(["epoch", "train_loss", "train_acc", "train_auc",
-                         "val_loss", "val_acc", "val_auc", "val_f1",
-                         "val_threshold", "lr"])
+    if csv_mode == "w":
+        csv_writer.writerow(["epoch", "train_loss", "train_acc", "train_auc",
+                             "val_loss", "val_acc", "val_auc", "val_f1",
+                             "val_threshold", "lr"])
 
     # ── Batch-level CSV ───────────────────────────────────────────
-    batch_log_file   = open(Path(args.ckpt_dir) / "batch_log.csv", "w",
+    batch_log_file   = open(Path(args.ckpt_dir) / "batch_log.csv", csv_mode,
                             newline="", encoding="utf-8")
     batch_csv_writer = csv.writer(batch_log_file)
-    batch_csv_writer.writerow(["epoch", "batch", "batch_loss", "batch_acc"])
+    if csv_mode == "w":
+        batch_csv_writer.writerow(["epoch", "batch", "batch_loss", "batch_acc"])
     batch_log_file.flush()
 
     # ── Early stopping ────────────────────────────────────────────

@@ -106,9 +106,35 @@ def collect_video_paths(dataset_root: str) -> List[Tuple[str, int]]:
     else:
         logger.warning(f"[FF++] Not found at {ffpp_root}")
 
+    # ── Test Videos (WhatsApp-compressed) ─────
+    # Adds real/fake WhatsApp videos to improve generalization
+    # on compressed, low-quality sources.
+    test_root = root / "test_videos"
+    if test_root.exists():
+        real_names = ["real", "real_videos", "Real", "reals"]
+        fake_names = ["fake", "deepfake_videos", "fake_videos", "Fake", "fakes", "deepfake"]
+
+        real_dir = next((test_root / n for n in real_names if (test_root / n).exists()), None)
+        fake_dir = next((test_root / n for n in fake_names if (test_root / n).exists()), None)
+
+        tv_real = tv_fake = 0
+        if real_dir:
+            for path in real_dir.rglob("*"):
+                if path.suffix.lower() in VIDEO_EXTS:
+                    samples.append((str(path), 0))
+                    tv_real += 1
+        if fake_dir:
+            for path in fake_dir.rglob("*"):
+                if path.suffix.lower() in VIDEO_EXTS:
+                    samples.append((str(path), 1))
+                    tv_fake += 1
+        logger.info(f"[TestVideos] Loaded {tv_real} real + {tv_fake} fake from {test_root}")
+    else:
+        logger.info(f"[TestVideos] Not found at {test_root} (skipping)")
+
     real_count = sum(1 for _, l in samples if l == 0)
     fake_count = sum(1 for _, l in samples if l == 1)
-    logger.info(f"Total samples → Real: {real_count} | Fake: {fake_count} | Total: {len(samples)}")
+    logger.info(f"Total samples -> Real: {real_count} | Fake: {fake_count} | Total: {len(samples)}")
     return samples
 
 
